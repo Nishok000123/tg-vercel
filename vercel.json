@@ -1,6 +1,6 @@
 {
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
   "functions": {
-    "api/mt.py": { "maxDuration": 60, "memory": 512 }
+    "api/index.py": { "maxDuration": 60, "memory": 512 }
   }
 }
