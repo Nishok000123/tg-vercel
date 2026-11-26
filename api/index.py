@@ -147,6 +147,11 @@ def _req_pq_plain() -> bytes:
     return b"\x00" * 8 + struct.pack("<QQ", msg_id(), len(req_pq)) + req_pq
 
 
+@app.get("/api/mt/version")
+async def mt_version():
+    return JSONResponse({"ok": True, "version": "v3-proxytest", "threading": True})
+
+
 @app.get("/api/mt/test/{dc}")
 async def mt_test(dc: int):
     try:
@@ -173,13 +178,19 @@ async def mt_test(dc: int):
         conn.close()
 @app.post("/api/mt/proxytest/{dc}")
 async def mt_proxytest(dc: int, request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "bad json: " + repr(e)}, status_code=400)
     proxies = data.get("proxies", [])
     from concurrent.futures import ThreadPoolExecutor
     proxies = proxies[:20]
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = [pool.submit(_proxy_test_one, p["server"], p["port"], p["secret"], dc) for p in proxies]
-        results = [f.result() for f in futs]
+    def run_all():
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = [pool.submit(_proxy_test_one, p["server"], p["port"], p["secret"], dc) for p in proxies]
+            return [f.result() for f in futs]
+    import anyio
+    results = await anyio.to_thread.run_sync(run_all)
     wins = [r for r in results if r.get("ok")]
     return JSONResponse({"tested": len(results), "wins": wins, "results": results})
 
