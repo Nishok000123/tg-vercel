@@ -159,7 +159,7 @@ def _proxy_test_one(server: str, port: int, secret: str, dc: int) -> dict:
 
 @app.get("/api/mt/version")
 async def mt_version():
-    return JSONResponse({"ok": True, "version": "v4-clean"})
+    return JSONResponse({"ok": True, "version": "v5-padded"})
 
 
 @app.get("/api/mt/test/{dc}")
