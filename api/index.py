@@ -1,22 +1,14 @@
-"""Vercel entrypoint: Bot API reverse proxy + MTProto DC relay.
-
-- any other path  -> https://api.telegram.org/{path}  (Bot API proxy, original use)
-- /api/mt/test/{dc} -> probe: obfuscated2 init + req_pq_multi against the DC IP
-- /api/mt/{dc}       -> MTProto relay: one MTProto message per POST round trip
-
-Cloudflare Workers egress is blocked by Telegram for raw MTProto, so the
-Worker ships its MTProto payloads here; Vercel/AWS egress is not blocked.
-"""
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, Response
-import httpx
-
 import secrets
 import socket
 import struct
 import time
+import hashlib
+import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+import httpx
 
 app = FastAPI()
 
@@ -114,6 +106,47 @@ def msg_id() -> int:
     return ((int(time.time()) << 32) | secrets.randbits(32)) & 0xFFFFFFFFFFFFFFFF
 
 
+class ProxyConn(DcConn):
+    """MTProto proxy connection (Telethon TcpMTProxy): obfuscated2 with the
+    proxy secret in the key derivation, DC id at init bytes 60-61."""
+
+    def __init__(self, server: str, port: int, secret16: bytes, dc: int):
+        self.sock = socket.create_connection((server, port), timeout=8)
+        self.sock.settimeout(12)
+
+        while True:
+            init = bytearray(secrets.token_bytes(64))
+            first = struct.unpack("<I", init[:4])[0]
+            if (
+                init[0] == 0xEF
+                or first in FORBIDDEN
+                or init[4:8] == b"\x00\x00\x00\x00"
+            ):
+                continue
+            break
+        init[56:60] = b"\xef\xef\xef\xef"
+        init[60:62] = struct.pack("<h", dc)
+
+        rev = bytes(init[8:56])[::-1]
+        self.enc = self._ctr(hashlib.sha256(bytes(init[8:40]) + secret16).digest(), bytes(init[40:56]))
+        self.dec = self._ctr(hashlib.sha256(rev[:32] + secret16).digest(), rev[32:48])
+
+        full = self.enc.encrypt(bytes(init))
+        wire = bytes(init[:56]) + full[56:64]
+        self.sock.sendall(wire)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _req_pq_plain() -> bytes:
+    req_pq = struct.pack("<I", 0xBE7E8EF1) + secrets.token_bytes(16)
+    return b"\x00" * 8 + struct.pack("<QQ", msg_id(), len(req_pq)) + req_pq
+
+
 @app.get("/api/mt/test/{dc}")
 async def mt_test(dc: int):
     try:
@@ -121,9 +154,7 @@ async def mt_test(dc: int):
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "stage": "connect", "error": repr(e)})
     try:
-        req_pq = struct.pack("<I", 0xBE7E8EF1) + secrets.token_bytes(16)
-        plain = b"\x00" * 8 + struct.pack("<QQ", msg_id(), len(req_pq)) + req_pq
-        conn.send_frame(plain)
+        conn.send_frame(_req_pq_plain())
         resp = conn.recv_frame()
         body = resp[20 : 20 + struct.unpack("<I", resp[16:20])[0]]
         return JSONResponse(
@@ -163,7 +194,42 @@ async def mt_relay(dc: int, request: Request):
         conn.close()
 
 
-# ---------------- Bot API reverse proxy (original behavior) ----------------
+def _proxy_test_one(server: str, port: int, secret: str, dc: int) -> dict:
+    if secret.startswith("ee"):
+        return {"server": server, "port": port, "error": "ee/faketls skipped"}
+    if secret.startswith("dd"):
+        secret = secret[2:]
+    if len(secret) < 32:
+        return {"server": server, "port": port, "error": "bad secret"}
+    secret16 = bytes.fromhex(secret[:32])
+    conn = None
+    try:
+        conn = ProxyConn(server, int(port), secret16, dc)
+        conn.send_frame(_req_pq_plain())
+        resp = conn.recv_frame()
+        body = resp[20 : 20 + struct.unpack("<I", resp[16:20])[0]]
+        is_respq = body[:4] == struct.pack("<I", 0x83C09AEC)
+        return {"server": server, "port": port, "ok": is_respq, "resp": body[:8].hex()}
+    except Exception as e:  # noqa: BLE001
+        return {"server": server, "port": port, "error": repr(e)}
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.post("/api/mt/proxytest/{dc}")
+async def mt_proxytest(dc: int, request: Request):
+    data = await request.json()
+    proxies = data.get("proxies", [])
+    loop = asyncio.get_event_loop()
+    results = []
+    for p in proxies[:25]:
+        results.append(await loop.run_in_executor(None, _proxy_test_one, p["server"], p["port"], p["secret"], dc))
+    wins = [r for r in results if r.get("ok")]
+    return JSONResponse({"tested": len(results), "wins": wins, "results": results})
+
+
+# ---------------- Bot API reverse proxy (catch-all, MUST be last) ----------------
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, path: str):
     target_url = f"https://api.telegram.org/{path}"
