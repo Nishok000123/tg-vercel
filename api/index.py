@@ -1,18 +1,18 @@
+"""Vercel entrypoint: Bot API reverse proxy + MTProto DC relay + MTProxy test."""
+import asyncio
+import hashlib
+import httpx
 import secrets
 import socket
 import struct
 import time
-import hashlib
-import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, Response
-import httpx
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 app = FastAPI()
-
-# ---------------- MTProto DC relay ----------------
 
 DC_IPS = {
     1: "149.154.175.50",
@@ -25,39 +25,51 @@ DC_IPS = {
 FORBIDDEN = (0xDDDDDDDD, 0xEEEEEEEE, 0x44414548, 0x54534F50, 0x20544547, 0x4954504F, 0x47525650, 0x02010316)
 
 
+def _ctr(key: bytes, iv: bytes) -> AES:
+    return AES.new(key, AES.MODE_CTR, counter=Counter.new(128, initial_value=int.from_bytes(iv, "big")))
+
+
+def _msg_id() -> int:
+    return ((int(time.time()) << 32) | secrets.randbits(32)) & 0xFFFFFFFFFFFFFFFF
+
+
+def _req_pq_plain() -> bytes:
+    req_pq = struct.pack("<I", 0xBE7E8EF1) + secrets.token_bytes(16)
+    return b"\x00" * 8 + struct.pack("<QQ", _msg_id(), len(req_pq)) + req_pq
+
+
 class DcConn:
-    """One obfuscated abridged MTProto TCP connection. Standard obfuscated2
-    (Telethon ConnectionTcpObfuscated): raw CTR keys derived from the init,
-    abridged framing inside. One frame per request, then closed."""
+    """Obfuscated abridged MTProto TCP connection, standard obfuscated2."""
 
     def __init__(self, dc: int):
-        self.ip = DC_IPS[dc]
-        self.sock = socket.create_connection((self.ip, 443), timeout=10)
-        self.sock.settimeout(25)
+        self._open(DC_IPS[dc], 443, secret=None, dc_id=None)
 
+    def _open(self, host: str, port: int, secret: bytes | None, dc_id: int | None):
+        self.sock = socket.create_connection((host, port), timeout=10)
+        self.sock.settimeout(25)
         while True:
             init = bytearray(secrets.token_bytes(64))
             first = struct.unpack("<I", init[:4])[0]
-            if (
-                init[0] == 0xEF
-                or first in FORBIDDEN
-                or init[4:8] == b"\x00\x00\x00\x00"
-            ):
+            if init[0] == 0xEF or first in FORBIDDEN or init[4:8] == b"\x00\x00\x00\x00":
                 continue
             break
         init[56:60] = b"\xef\xef\xef\xef"
+        if dc_id is not None:
+            init[60:62] = struct.pack("<h", dc_id)
 
-        self.enc = self._ctr(bytes(init[8:40]), bytes(init[40:56]))
+        enc_key = bytes(init[8:40])
+        enc_iv = bytes(init[40:56])
         rev = bytes(init[8:56])[::-1]
-        self.dec = self._ctr(rev[:32], rev[32:48])
+        dec_key = rev[:32]
+        dec_iv = rev[32:48]
+        if secret is not None:
+            enc_key = hashlib.sha256(enc_key + secret).digest()
+            dec_key = hashlib.sha256(dec_key + secret).digest()
 
+        self.enc = _ctr(enc_key, enc_iv)
+        self.dec = _ctr(dec_key, dec_iv)
         full = self.enc.encrypt(bytes(init))
-        wire = bytes(init[:56]) + full[56:64]
-        self.sock.sendall(wire)
-
-    @staticmethod
-    def _ctr(key: bytes, iv: bytes) -> AES:
-        return AES.new(key, AES.MODE_CTR, counter=Counter.new(128, initial_value=int.from_bytes(iv, "big")))
+        self.sock.sendall(bytes(init[:56]) + full[56:64])
 
     def send_frame(self, payload: bytes) -> None:
         words = len(payload) // 4
@@ -92,64 +104,52 @@ class DcConn:
     def _read(self) -> bytes:
         chunk = self.sock.recv(65536)
         if not chunk:
-            raise ConnectionError("dc closed connection")
-        return self.dec.decrypt(chunk)
+            raise ConnectionError("peer closed connection")
+        return self.dec.encrypt(chunk)
 
     def close(self):
         try:
             self.sock.close()
         except OSError:
             pass
-
-
-def msg_id() -> int:
-    return ((int(time.time()) << 32) | secrets.randbits(32)) & 0xFFFFFFFFFFFFFFFF
 
 
 class ProxyConn(DcConn):
     """MTProto proxy connection (Telethon TcpMTProxy): obfuscated2 with the
-    proxy secret in the key derivation, DC id at init bytes 60-61."""
+    proxy secret, DC id at init bytes 60-61."""
 
     def __init__(self, server: str, port: int, secret16: bytes, dc: int):
-        self.sock = socket.create_connection((server, port), timeout=5)
-        self.sock.settimeout(6)
-
-        while True:
-            init = bytearray(secrets.token_bytes(64))
-            first = struct.unpack("<I", init[:4])[0]
-            if (
-                init[0] == 0xEF
-                or first in FORBIDDEN
-                or init[4:8] == b"\x00\x00\x00\x00"
-            ):
-                continue
-            break
-        init[56:60] = b"\xef\xef\xef\xef"
-        init[60:62] = struct.pack("<h", dc)
-
-        rev = bytes(init[8:56])[::-1]
-        self.enc = self._ctr(hashlib.sha256(bytes(init[8:40]) + secret16).digest(), bytes(init[40:56]))
-        self.dec = self._ctr(hashlib.sha256(rev[:32] + secret16).digest(), rev[32:48])
-
-        full = self.enc.encrypt(bytes(init))
-        wire = bytes(init[:56]) + full[56:64]
-        self.sock.sendall(wire)
-
-    def close(self):
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        self._open(server, int(port), secret=secret16, dc_id=dc)
 
 
-def _req_pq_plain() -> bytes:
-    req_pq = struct.pack("<I", 0xBE7E8EF1) + secrets.token_bytes(16)
-    return b"\x00" * 8 + struct.pack("<QQ", msg_id(), len(req_pq)) + req_pq
+def _proxy_test_one(server: str, port: int, secret: str, dc: int) -> dict:
+    if secret.startswith("ee"):
+        return {"server": server, "port": port, "error": "ee/faketls skipped"}
+    if secret.startswith("dd"):
+        secret = secret[2:]
+    if len(secret) < 32:
+        return {"server": server, "port": port, "error": "bad secret"}
+    secret16 = bytes.fromhex(secret[:32])
+    conn = None
+    try:
+        conn = ProxyConn(server, port, secret16, dc)
+        conn.send_frame(_req_pq_plain())
+        resp = conn.recv_frame()
+        body = resp[20 : 20 + struct.unpack("<I", resp[16:20])[0]]
+        is_respq = body[:4] == struct.pack("<I", 0x83C09AEC)
+        return {"server": server, "port": port, "ok": is_respq, "resp": body[:8].hex()}
+    except Exception as e:  # noqa: BLE001
+        return {"server": server, "port": port, "error": repr(e)}
+    finally:
+        if conn:
+            conn.close()
 
+
+# ---------------- MTProto endpoints (registered BEFORE the catch-all) --------
 
 @app.get("/api/mt/version")
 async def mt_version():
-    return JSONResponse({"ok": True, "version": "v3-proxytest", "threading": True})
+    return JSONResponse({"ok": True, "version": "v4-clean"})
 
 
 @app.get("/api/mt/test/{dc}")
@@ -166,7 +166,6 @@ async def mt_test(dc: int):
             {
                 "ok": True,
                 "dc": dc,
-                "ip": conn.ip,
                 "resp_len": len(resp),
                 "body_head": body[:48].hex(),
                 "is_respq": body[:4] == struct.pack("<I", 0x83C09AEC),
@@ -176,30 +175,32 @@ async def mt_test(dc: int):
         return JSONResponse({"ok": False, "stage": "rpc", "error": repr(e)})
     finally:
         conn.close()
+
+
 @app.post("/api/mt/proxytest/{dc}")
 async def mt_proxytest(dc: int, request: Request):
     try:
         data = await request.json()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": "bad json: " + repr(e)}, status_code=400)
-    proxies = data.get("proxies", [])
-    from concurrent.futures import ThreadPoolExecutor
-    proxies = proxies[:20]
+    proxies = data.get("proxies", [])[:20]
+
     def run_all():
         with ThreadPoolExecutor(max_workers=8) as pool:
             futs = [pool.submit(_proxy_test_one, p["server"], p["port"], p["secret"], dc) for p in proxies]
             return [f.result() for f in futs]
+
     import anyio
+
     try:
         results = await anyio.to_thread.run_sync(run_all)
-    except Exception:
+    except Exception:  # noqa: BLE001
         import traceback
-        return JSONResponse({"ok": False, "error": traceback.format_exc()[-1500:]}, status_code=200)
+
+        return JSONResponse({"ok": False, "error": traceback.format_exc()[-1200:]}, status_code=200)
     wins = [r for r in results if r.get("ok")]
     return JSONResponse({"tested": len(results), "wins": wins, "results": results})
 
-
-# ---------------- Bot API reverse proxy (catch-all, MUST be last) ----------------
 
 @app.post("/api/mt/{dc}")
 async def mt_relay(dc: int, request: Request):
@@ -221,13 +222,16 @@ async def mt_relay(dc: int, request: Request):
     finally:
         conn.close()
 
+
+# ---------------- Bot API reverse proxy (catch-all, MUST stay last) ---------
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, path: str):
     target_url = f"https://api.telegram.org/{path}"
     body = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
-    
+
     async with httpx.AsyncClient() as client:
         response = await client.request(
             method=request.method,
