@@ -111,8 +111,8 @@ class ProxyConn(DcConn):
     proxy secret in the key derivation, DC id at init bytes 60-61."""
 
     def __init__(self, server: str, port: int, secret16: bytes, dc: int):
-        self.sock = socket.create_connection((server, port), timeout=8)
-        self.sock.settimeout(12)
+        self.sock = socket.create_connection((server, port), timeout=5)
+        self.sock.settimeout(6)
 
         while True:
             init = bytearray(secrets.token_bytes(64))
@@ -171,7 +171,20 @@ async def mt_test(dc: int):
         return JSONResponse({"ok": False, "stage": "rpc", "error": repr(e)})
     finally:
         conn.close()
+@app.post("/api/mt/proxytest/{dc}")
+async def mt_proxytest(dc: int, request: Request):
+    data = await request.json()
+    proxies = data.get("proxies", [])
+    from concurrent.futures import ThreadPoolExecutor
+    proxies = proxies[:20]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [pool.submit(_proxy_test_one, p["server"], p["port"], p["secret"], dc) for p in proxies]
+        results = [f.result() for f in futs]
+    wins = [r for r in results if r.get("ok")]
+    return JSONResponse({"tested": len(results), "wins": wins, "results": results})
 
+
+# ---------------- Bot API reverse proxy (catch-all, MUST be last) ----------------
 
 @app.post("/api/mt/{dc}")
 async def mt_relay(dc: int, request: Request):
@@ -193,43 +206,6 @@ async def mt_relay(dc: int, request: Request):
     finally:
         conn.close()
 
-
-def _proxy_test_one(server: str, port: int, secret: str, dc: int) -> dict:
-    if secret.startswith("ee"):
-        return {"server": server, "port": port, "error": "ee/faketls skipped"}
-    if secret.startswith("dd"):
-        secret = secret[2:]
-    if len(secret) < 32:
-        return {"server": server, "port": port, "error": "bad secret"}
-    secret16 = bytes.fromhex(secret[:32])
-    conn = None
-    try:
-        conn = ProxyConn(server, int(port), secret16, dc)
-        conn.send_frame(_req_pq_plain())
-        resp = conn.recv_frame()
-        body = resp[20 : 20 + struct.unpack("<I", resp[16:20])[0]]
-        is_respq = body[:4] == struct.pack("<I", 0x83C09AEC)
-        return {"server": server, "port": port, "ok": is_respq, "resp": body[:8].hex()}
-    except Exception as e:  # noqa: BLE001
-        return {"server": server, "port": port, "error": repr(e)}
-    finally:
-        if conn:
-            conn.close()
-
-
-@app.post("/api/mt/proxytest/{dc}")
-async def mt_proxytest(dc: int, request: Request):
-    data = await request.json()
-    proxies = data.get("proxies", [])
-    loop = asyncio.get_event_loop()
-    results = []
-    for p in proxies[:25]:
-        results.append(await loop.run_in_executor(None, _proxy_test_one, p["server"], p["port"], p["secret"], dc))
-    wins = [r for r in results if r.get("ok")]
-    return JSONResponse({"tested": len(results), "wins": wins, "results": results})
-
-
-# ---------------- Bot API reverse proxy (catch-all, MUST be last) ----------------
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, path: str):
     target_url = f"https://api.telegram.org/{path}"
