@@ -190,7 +190,11 @@ async def mt_proxytest(dc: int, request: Request):
             futs = [pool.submit(_proxy_test_one, p["server"], p["port"], p["secret"], dc) for p in proxies]
             return [f.result() for f in futs]
     import anyio
-    results = await anyio.to_thread.run_sync(run_all)
+    try:
+        results = await anyio.to_thread.run_sync(run_all)
+    except Exception:
+        import traceback
+        return JSONResponse({"ok": False, "error": traceback.format_exc()[-1500:]}, status_code=200)
     wins = [r for r in results if r.get("ok")]
     return JSONResponse({"tested": len(results), "wins": wins, "results": results})
 
