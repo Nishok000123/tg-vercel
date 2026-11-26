@@ -44,7 +44,7 @@ class DcConn:
     def __init__(self, dc: int):
         self._open(DC_IPS[dc], 443, secret=None, dc_id=None)
 
-    def _open(self, host: str, port: int, secret: bytes | None, dc_id: int | None):
+    def _open(self, host: str, port: int, secret: bytes | None, dc_id: int | None, codec: str = "abridged"):
         self.sock = socket.create_connection((host, port), timeout=10)
         self.sock.settimeout(25)
         while True:
@@ -66,6 +66,7 @@ class DcConn:
             enc_key = hashlib.sha256(enc_key + secret).digest()
             dec_key = hashlib.sha256(dec_key + secret).digest()
 
+        self.codec = codec
         self.enc = _ctr(enc_key, enc_iv)
         self.dec = _ctr(dec_key, dec_iv)
         full = self.enc.encrypt(bytes(init))
@@ -79,7 +80,7 @@ class DcConn:
     def recv_frame(self) -> bytes:
         buf = b""
         while True:
-            if buf:
+            if buf and self.codec != "padded":
                 first = buf[0]
                 if first & 0x80:
                     if len(buf) < 4:
@@ -99,6 +100,13 @@ class DcConn:
                 total = header_len + words * 4
                 if len(buf) >= total:
                     return buf[header_len:total]
+            if self.codec == "padded":
+                if len(buf) >= 4:
+                    n = struct.unpack("<I", buf[:4])[0]
+                    if len(buf) >= 4 + n:
+                        frame = buf[4 : 4 + n]
+                        tail = n % 4
+                        return frame[: n - tail] if tail else frame
             buf += self._read()
 
     def _read(self) -> bytes:
@@ -118,21 +126,23 @@ class ProxyConn(DcConn):
     """MTProto proxy connection (Telethon TcpMTProxy): obfuscated2 with the
     proxy secret, DC id at init bytes 60-61."""
 
-    def __init__(self, server: str, port: int, secret16: bytes, dc: int):
-        self._open(server, int(port), secret=secret16, dc_id=dc)
+    def __init__(self, server: str, port: int, secret16: bytes, dc: int, codec: str = "abridged"):
+        self._open(server, int(port), secret=secret16, dc_id=dc, codec=codec)
 
 
 def _proxy_test_one(server: str, port: int, secret: str, dc: int) -> dict:
     if secret.startswith("ee"):
         return {"server": server, "port": port, "error": "ee/faketls skipped"}
+    codec = "abridged"
     if secret.startswith("dd"):
+        codec = "padded"
         secret = secret[2:]
     if len(secret) < 32:
         return {"server": server, "port": port, "error": "bad secret"}
     secret16 = bytes.fromhex(secret[:32])
     conn = None
     try:
-        conn = ProxyConn(server, port, secret16, dc)
+        conn = ProxyConn(server, port, secret16, dc, codec=codec)
         conn.send_frame(_req_pq_plain())
         resp = conn.recv_frame()
         body = resp[20 : 20 + struct.unpack("<I", resp[16:20])[0]]
